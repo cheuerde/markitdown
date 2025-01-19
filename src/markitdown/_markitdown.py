@@ -698,24 +698,99 @@ class PdfConverter(DocumentConverter):
 
 class DocxConverter(HtmlConverter):
     """
-    Converts DOCX files to Markdown. Style information (e.g.m headings) and tables are preserved where possible.
+    Converts DOCX files to Markdown. Style information (e.g., headings) and tables are preserved where possible.
     """
 
-    def convert(self, local_path, **kwargs) -> Union[None, DocumentConverterResult]:
+    def sanitize_filename(self, name: str) -> str:
+        """Sanitizes a string to make it a valid file name across different operating systems."""
+        # Normalize underscore
+        name = re.sub(r"\s+", "_", name.strip())
+
+        # Replace invalid characters with underscores
+        name = re.sub(r'[\\/*?:"<>|]', "_", name)
+
+        # Remove leading and trailing dots and spaces
+        name = name.strip(" .")
+
+        # Limit the length of the filename to a reasonable length (e.g., 251 characters)
+        max_length = 251
+        if len(name) > max_length:
+            name = name[:max_length]
+
+        return name
+
+    def truncate_filename(self, name: str, max_length: int, extension: str = "") -> str:
+        """Truncates the filename to ensure the final length is within the limit."""
+        max_base_length = max_length - len(extension)
+        if len(name) > max_base_length:
+            return name[:max_base_length]
+        return name
+
+    def unique_filename(self, base_path: str, max_length: int = 251) -> str:
+        """Generates a unique filename while ensuring it stays within the length limit."""
+        base, ext = os.path.splitext(base_path)
+        truncated_base = self.truncate_filename(base, max_length, ext)
+
+        counter = 1
+        unique_path = f"{truncated_base}{ext}"
+        while os.path.exists(unique_path):
+            suffix = f"_{counter}"
+            # Ensure base is short enough to add the suffix
+            truncated_base = self.truncate_filename(
+                base, max_length - len(suffix) - len(ext)
+            )
+            unique_path = f"{truncated_base}{suffix}{ext}"
+            counter += 1
+
+        return unique_path
+
+    def convert_image(self, image, output_dir: str) -> dict:
+        """Handles image extraction and saving with collision avoidance and length limits."""
+        os.makedirs(output_dir, exist_ok=True)
+
+        image.alt_text = image.alt_text.replace("\n", " ")
+        raw_name = image.alt_text or f"image_{hash(image)}"
+        sanitized_name = self.sanitize_filename(raw_name)
+        truncated_name = self.truncate_filename(sanitized_name, 251, ".png")
+        image_path = os.path.join(output_dir, truncated_name + ".png")
+
+        # Ensure unique filename
+        image_path = self.unique_filename(image_path)
+
+        try:
+            with image.open() as image_bytes:
+                with open(image_path, "wb") as img_file:
+                    img_file.write(image_bytes.read())
+            return {"src": image_path, "alt": image.alt_text}
+        except Exception:
+            # Return an empty src if saving fails
+            return {"src": ""}
+
+    def convert(
+        self, local_path: str, **kwargs
+    ) -> Union[None, DocumentConverterResult]:
         # Bail if not a DOCX
         extension = kwargs.get("file_extension", "")
         if extension.lower() != ".docx":
             return None
 
-        result = None
-        with open(local_path, "rb") as docx_file:
-            style_map = kwargs.get("style_map", None)
+        try:
+            with open(local_path, "rb") as docx_file:
+                style_map = kwargs.get("style_map")
+                image_output_dir = kwargs.get("image_output_dir", "images")
 
-            result = mammoth.convert_to_html(docx_file, style_map=style_map)
-            html_content = result.value
-            result = self._convert(html_content)
+                mammoth_result = mammoth.convert_to_html(
+                    docx_file,
+                    style_map=style_map,
+                    convert_image=mammoth.images.inline(
+                        lambda img: self.convert_image(img, image_output_dir)
+                    ),
+                )
 
-        return result
+                html_content = mammoth_result.value
+                return self._convert(html_content)
+        except Exception:
+            return None
 
 
 class XlsxConverter(HtmlConverter):
@@ -765,92 +840,137 @@ class XlsConverter(HtmlConverter):
             text_content=md_content.strip(),
         )
 
-
 class PptxConverter(HtmlConverter):
     """
-    Converts PPTX files to Markdown. Supports heading, tables and images with alt text.
+    Converts PPTX files to Markdown. Supports heading, tables, images with alt text, and charts.
+    Images are extracted and saved alongside the markdown file.
     """
 
-    def convert(self, local_path, **kwargs) -> Union[None, DocumentConverterResult]:
+    def sanitize_filename(self, name: str) -> str:
+        """Sanitizes a string to make it a valid file name across different operating systems."""
+        # Normalize underscore
+        name = re.sub(r"\s+", "_", name.strip())
+        # Replace invalid characters with underscores
+        name = re.sub(r'[\\/*?:"<>|]', "_", name)
+        # Remove leading and trailing dots and spaces
+        name = name.strip(" .")
+        # Limit the length of the filename
+        max_length = 251
+        if len(name) > max_length:
+            name = name[:max_length]
+        return name
+
+    def extract_image(self, shape, output_dir: str, slide_num: int, shape_idx: int) -> Optional[dict]:
+        """Extracts and saves an image from a PowerPoint shape."""
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+
+            # Get alt text and image data
+            alt_text = ""
+            try:
+                alt_text = shape._element._nvXxPr.cNvPr.attrib.get("descr", "")
+            except Exception:
+                pass
+
+            if not alt_text:
+                alt_text = f"Slide {slide_num} - Image {shape_idx}"
+
+            # Determine image extension
+            image_type = shape.image.content_type.split('/')[-1]
+            if image_type == 'jpeg':
+                image_type = 'jpg'
+
+            # Generate filename
+            base_name = self.sanitize_filename(f"slide_{slide_num}_image_{shape_idx}")
+            image_path = os.path.join(output_dir, f"{base_name}.{image_type}")
+
+            # Save the image
+            with open(image_path, "wb") as img_file:
+                img_file.write(shape.image.blob)
+
+            # Return relative path for markdown
+            return {
+                "src": os.path.relpath(image_path, os.path.dirname(os.path.abspath(self._current_file))),
+                "alt": alt_text
+            }
+        except Exception as e:
+            print(f"Warning: Failed to extract image: {str(e)}")
+            return None
+
+    def convert(self, local_path: str, **kwargs: Any) -> Union[None, DocumentConverterResult]:
         # Bail if not a PPTX
         extension = kwargs.get("file_extension", "")
         if extension.lower() != ".pptx":
             return None
 
+        # Store the current file path for relative path calculation
+        self._current_file = local_path
+        
+        # Create image directory next to the markdown file
+        output_dir = kwargs.get("image_output_dir")
+        if output_dir is None:
+            output_dir = os.path.join(
+                os.path.dirname(local_path),
+                "images_" + os.path.basename(local_path).replace(".pptx", "")
+            )
+
         md_content = ""
-
         presentation = pptx.Presentation(local_path)
-        slide_num = 0
-        for slide in presentation.slides:
-            slide_num += 1
 
-            md_content += f"\n\n<!-- Slide number: {slide_num} -->\n"
+        for slide_num, slide in enumerate(presentation.slides, 1):
+            md_content += f"\n\n## Slide {slide_num}\n\n"
 
-            title = slide.shapes.title
-            for shape in slide.shapes:
-                # Pictures
+            # Handle title first if present
+            if slide.shapes.title:
+                md_content += f"# {slide.shapes.title.text.strip()}\n\n"
+
+            # Process all shapes in the slide
+            for shape_idx, shape in enumerate(slide.shapes, 1):
+                if shape == slide.shapes.title:
+                    continue  # Skip title as we've already processed it
+
+                # Handle images
                 if self._is_picture(shape):
-                    # https://github.com/scanny/python-pptx/pull/512#issuecomment-1713100069
-                    alt_text = ""
-                    try:
-                        alt_text = shape._element._nvXxPr.cNvPr.attrib.get("descr", "")
-                    except Exception:
-                        pass
+                    image_info = self.extract_image(shape, output_dir, slide_num, shape_idx)
+                    if image_info:
+                        md_content += f"![{image_info['alt']}]({image_info['src']})\n\n"
 
-                    # A placeholder name
-                    filename = re.sub(r"\W", "", shape.name) + ".jpg"
-                    md_content += (
-                        "\n!["
-                        + (alt_text if alt_text else shape.name)
-                        + "]("
-                        + filename
-                        + ")\n"
-                    )
-
-                # Tables
-                if self._is_table(shape):
-                    html_table = "<html><body><table>"
-                    first_row = True
+                # Handle tables
+                elif self._is_table(shape):
+                    html_table = "<table>"
                     for row in shape.table.rows:
                         html_table += "<tr>"
                         for cell in row.cells:
-                            if first_row:
-                                html_table += "<th>" + html.escape(cell.text) + "</th>"
-                            else:
-                                html_table += "<td>" + html.escape(cell.text) + "</td>"
+                            html_table += f"<td>{html.escape(cell.text)}</td>"
                         html_table += "</tr>"
-                        first_row = False
-                    html_table += "</table></body></html>"
-                    md_content += (
-                        "\n" + self._convert(html_table).text_content.strip() + "\n"
-                    )
+                    html_table += "</table>"
+                    md_content += self._convert(html_table).text_content + "\n\n"
 
-                # Charts
-                if shape.has_chart:
-                    md_content += self._convert_chart_to_markdown(shape.chart)
+                # Handle charts
+                elif shape.has_chart:
+                    md_content += self._convert_chart_to_markdown(shape.chart) + "\n\n"
 
-                # Text areas
+                # Handle text frames
                 elif shape.has_text_frame:
-                    if shape == title:
-                        md_content += "# " + shape.text.lstrip() + "\n"
-                    else:
-                        md_content += shape.text + "\n"
+                    text = shape.text.strip()
+                    if text:
+                        md_content += f"{text}\n\n"
 
-            md_content = md_content.strip()
+            # Add slide notes if present
+            if slide.has_notes_slide and slide.notes_slide.notes_text_frame:
+                notes = slide.notes_slide.notes_text_frame.text.strip()
+                if notes:
+                    md_content += f"\n### Slide Notes\n\n{notes}\n\n"
 
-            if slide.has_notes_slide:
-                md_content += "\n\n### Notes:\n"
-                notes_frame = slide.notes_slide.notes_text_frame
-                if notes_frame is not None:
-                    md_content += notes_frame.text
-                md_content = md_content.strip()
+            md_content += "---\n"  # Add separator between slides
 
         return DocumentConverterResult(
             title=None,
-            text_content=md_content.strip(),
+            text_content=md_content.strip()
         )
 
-    def _is_picture(self, shape):
+    def _is_picture(self, shape) -> bool:
+        """Check if shape is a picture."""
         if shape.shape_type == pptx.enum.shapes.MSO_SHAPE_TYPE.PICTURE:
             return True
         if shape.shape_type == pptx.enum.shapes.MSO_SHAPE_TYPE.PLACEHOLDER:
@@ -858,59 +978,64 @@ class PptxConverter(HtmlConverter):
                 return True
         return False
 
-    def _is_table(self, shape):
-        if shape.shape_type == pptx.enum.shapes.MSO_SHAPE_TYPE.TABLE:
-            return True
-        return False
+    def _is_table(self, shape) -> bool:
+        """Check if shape is a table."""
+        return shape.shape_type == pptx.enum.shapes.MSO_SHAPE_TYPE.TABLE
 
-    def _convert_chart_to_markdown(self, chart):
-        md = "\n\n### Chart"
+    def _convert_chart_to_markdown(self, chart) -> str:
+        """Convert a chart to markdown table format."""
+        md = "\n### Chart"
         if chart.has_title:
             md += f": {chart.chart_title.text_frame.text}"
         md += "\n\n"
+
+        # Extract data from chart
         data = []
-        category_names = [c.label for c in chart.plots[0].categories]
-        series_names = [s.name for s in chart.series]
-        data.append(["Category"] + series_names)
+        try:
+            # Get categories (x-axis labels)
+            category_names = [c.label for c in chart.plots[0].categories]
+            # Get series names (legend labels)
+            series_names = [s.name for s in chart.series]
+            
+            # Create header row with "Category" and series names
+            data.append(["Category"] + series_names)
 
-        for idx, category in enumerate(category_names):
-            row = [category]
-            for series in chart.series:
-                row.append(series.values[idx])
-            data.append(row)
+            # Add data rows
+            for idx, category in enumerate(category_names):
+                row = [category]
+                for series in chart.series:
+                    row.append(series.values[idx])
+                data.append(row)
 
-        markdown_table = []
-        for row in data:
-            markdown_table.append("| " + " | ".join(map(str, row)) + " |")
-        header = markdown_table[0]
-        separator = "|" + "|".join(["---"] * len(data[0])) + "|"
-        return md + "\n".join([header, separator] + markdown_table[1:])
+            # Convert to markdown table
+            markdown_table = []
+            for row in data:
+                markdown_table.append("| " + " | ".join(map(str, row)) + " |")
+            
+            header = markdown_table[0]
+            separator = "|" + "|".join(["---"] * len(data[0])) + "|"
+            
+            return md + "\n".join([header, separator] + markdown_table[1:])
+        except Exception as e:
+            return md + f"\n\nError converting chart: {str(e)}\n"
 
+    def _convert_html_table(self, html_table: str) -> str:
+        """Convert HTML table to markdown format."""
+        return self._convert(f"<html><body>{html_table}</body></html>").text_content
 
 class MediaConverter(DocumentConverter):
     """
     Abstract class for multi-modal media (e.g., images and audio)
     """
 
-    def _get_metadata(self, local_path, exiftool_path=None):
-        if not exiftool_path:
-            which_exiftool = shutil.which("exiftool")
-            if which_exiftool:
-                warn(
-                    f"""Implicit discovery of 'exiftool' is disabled. If you would like to continue to use exiftool in MarkItDown, please set the exiftool_path parameter in the MarkItDown consructor. E.g., 
-
-    md = MarkItDown(exiftool_path="{which_exiftool}")
-
-This warning will be removed in future releases.
-""",
-                    DeprecationWarning,
-                )
-
+    def _get_metadata(self, local_path):
+        exiftool = shutil.which("exiftool")
+        if not exiftool:
             return None
         else:
             try:
                 result = subprocess.run(
-                    [exiftool_path, "-json", local_path], capture_output=True, text=True
+                    [exiftool, "-json", local_path], capture_output=True, text=True
                 ).stdout
                 return json.loads(result)[0]
             except Exception:
@@ -931,7 +1056,7 @@ class WavConverter(MediaConverter):
         md_content = ""
 
         # Add metadata
-        metadata = self._get_metadata(local_path, kwargs.get("exiftool_path"))
+        metadata = self._get_metadata(local_path)
         if metadata:
             for f in [
                 "Title",
@@ -986,7 +1111,7 @@ class Mp3Converter(WavConverter):
         md_content = ""
 
         # Add metadata
-        metadata = self._get_metadata(local_path, kwargs.get("exiftool_path"))
+        metadata = self._get_metadata(local_path)
         if metadata:
             for f in [
                 "Title",
@@ -1047,7 +1172,7 @@ class ImageConverter(MediaConverter):
         md_content = ""
 
         # Add metadata
-        metadata = self._get_metadata(local_path, kwargs.get("exiftool_path"))
+        metadata = self._get_metadata(local_path)
         if metadata:
             for f in [
                 "ImageSize",
@@ -1236,6 +1361,12 @@ class ZipConverter(DocumentConverter):
         if extension.lower() != ".zip":
             return None
 
+        # Skip Office files even though they are technically ZIP files
+        office_extensions = ['.docx', '.pptx', '.xlsx']
+        file_name = os.path.basename(local_path).lower()
+        if any(file_name.endswith(ext) for ext in office_extensions):
+            return None
+
         # Get parent converters list if available
         parent_converters = kwargs.get("_parent_converters", [])
         if not parent_converters:
@@ -1336,7 +1467,6 @@ class MarkItDown:
         llm_client: Optional[Any] = None,
         llm_model: Optional[str] = None,
         style_map: Optional[str] = None,
-        exiftool_path: Optional[str] = None,
         # Deprecated
         mlm_client: Optional[Any] = None,
         mlm_model: Optional[str] = None,
@@ -1345,9 +1475,6 @@ class MarkItDown:
             self._requests_session = requests.Session()
         else:
             self._requests_session = requests_session
-
-        if exiftool_path is None:
-            exiftool_path = os.environ.get("EXIFTOOL_PATH")
 
         # Handle deprecation notices
         #############################
@@ -1381,7 +1508,6 @@ class MarkItDown:
         self._llm_client = llm_client
         self._llm_model = llm_model
         self._style_map = style_map
-        self._exiftool_path = exiftool_path
 
         self._page_converters: List[DocumentConverter] = []
 
@@ -1565,14 +1691,11 @@ class MarkItDown:
                 if "llm_model" not in _kwargs and self._llm_model is not None:
                     _kwargs["llm_model"] = self._llm_model
 
-                if "style_map" not in _kwargs and self._style_map is not None:
-                    _kwargs["style_map"] = self._style_map
-
-                if "exiftool_path" not in _kwargs and self._exiftool_path is not None:
-                    _kwargs["exiftool_path"] = self._exiftool_path
-
                 # Add the list of converters for nested processing
                 _kwargs["_parent_converters"] = self._page_converters
+
+                if "style_map" not in _kwargs and self._style_map is not None:
+                    _kwargs["style_map"] = self._style_map
 
                 # If we hit an error log it and keep trying
                 try:
