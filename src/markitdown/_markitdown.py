@@ -9,6 +9,7 @@ import os
 import re
 import shutil
 import subprocess
+from typing import Optional
 import sys
 import tempfile
 import traceback
@@ -875,28 +876,81 @@ class PptxConverter(HtmlConverter):
             if not alt_text:
                 alt_text = f"Slide {slide_num} - Image {shape_idx}"
 
-            # Determine image extension
-            image_type = shape.image.content_type.split('/')[-1]
+            # Generate base filename
+            base_name = self.sanitize_filename(f"slide_{slide_num}_image_{shape_idx}")
+            
+            # Check if shape actually has image data
+            if not hasattr(shape, 'image') or not hasattr(shape.image, 'blob'):
+                print(f"Warning: Shape in slide {slide_num} has no valid image data")
+                return None
+
+            # Determine image type and handle special formats
+            try:
+                image_type = shape.image.content_type.split('/')[-1].lower()
+            except AttributeError:
+                print(f"Warning: Cannot determine image type for shape in slide {slide_num}")
+                return None
+
             if image_type == 'jpeg':
                 image_type = 'jpg'
+                final_path = os.path.join(output_dir, f"{base_name}.{image_type}")
+                with open(final_path, "wb") as img_file:
+                    img_file.write(shape.image.blob)
+                    
+            elif image_type in ['x-wmf', 'wmf']:
+                # Save WMF to temporary file
+                temp_wmf = os.path.join(output_dir, f"{base_name}_temp.wmf")
+                final_path = os.path.join(output_dir, f"{base_name}.png")
+                
+                try:
+                    # Write the WMF file
+                    with open(temp_wmf, "wb") as img_file:
+                        img_file.write(shape.image.blob)
+                    
+                    # Try to convert WMF to PNG using ImageMagick
+                    if shutil.which('magick'):  # Check if ImageMagick is installed
+                        try:
+                            subprocess.run(
+                                ['magick', temp_wmf, final_path], 
+                                check=True,
+                                capture_output=True,
+                                text=True
+                            )
+                            os.remove(temp_wmf)  # Clean up temp file if conversion succeeded
+                        except subprocess.CalledProcessError as e:
+                            print(f"Warning: WMF conversion failed: {e.stderr}")
+                            os.rename(temp_wmf, final_path)
+                    else:
+                        # If ImageMagick isn't available, just rename WMF file
+                        os.rename(temp_wmf, final_path)
+                        print(f"Note: ImageMagick not found. WMF file saved as {os.path.basename(final_path)}")
+                except Exception as e:
+                    print(f"Warning: Error handling WMF file: {str(e)}")
+                    if os.path.exists(temp_wmf):
+                        os.rename(temp_wmf, final_path)
+                    
+            else:
+                # Handle all other image types normally
+                final_path = os.path.join(output_dir, f"{base_name}.{image_type}")
+                with open(final_path, "wb") as img_file:
+                    img_file.write(shape.image.blob)
 
-            # Generate filename
-            base_name = self.sanitize_filename(f"slide_{slide_num}_image_{shape_idx}")
-            image_path = os.path.join(output_dir, f"{base_name}.{image_type}")
-
-            # Save the image
-            with open(image_path, "wb") as img_file:
-                img_file.write(shape.image.blob)
+            # Verify the file was created
+            if not os.path.exists(final_path):
+                print(f"Warning: Failed to create image file: {os.path.basename(final_path)}")
+                return None
 
             # Return relative path for markdown
             return {
-                "src": os.path.relpath(image_path, os.path.dirname(os.path.abspath(self._current_file))),
+                "src": os.path.relpath(final_path, os.path.dirname(os.path.abspath(self._current_file))),
                 "alt": alt_text
             }
         except Exception as e:
             print(f"Warning: Failed to extract image: {str(e)}")
             return None
 
+
+    
     def convert(self, local_path: str, **kwargs: Any) -> Union[None, DocumentConverterResult]:
         # Bail if not a PPTX
         extension = kwargs.get("file_extension", "")
